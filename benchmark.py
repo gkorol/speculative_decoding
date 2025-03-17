@@ -1,5 +1,6 @@
 import time
-from speculative_decoding import SpeculativeDecoder
+from original_speculative_decoding import SpeculativeDecoder as originalDecoder
+from speculative_decoding import SpeculativeDecoderExp
 from typing import Tuple
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -12,6 +13,9 @@ import os.path
 
 from iree import compiler as ireec
 import iree.turbine.aot as aot
+
+import subprocess
+
 
 # from transformers.onnx import export
 
@@ -93,19 +97,39 @@ def benchmark_v2(
         A tuple of (avg_spec_decoding_runtime, avg_greedy_decoding_runtime, 
                     avg_spec_tokens_per_second, avg_greedy_tokens_per_second)
     """
-    decoder = SpeculativeDecoder(main_model_name, draft_model_name)
-    prompt = "Once upon a time,"
+    decoder = SpeculativeDecoderExp(main_model_name, draft_model_name)
+    prompt = "Once upon a time, "
     
     tokenizer = AutoTokenizer.from_pretrained(main_model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    print(int(tokenizer.eos_token))
     input_ids = tokenizer.encode(prompt, return_tensors="pt").to('cpu')
     len_encoded_prompt = len(tokenizer.encode(prompt))       
 
     example_encoding = tokenizer(prompt, return_tensors="pt")
     example_input = example_encoding["input_ids"].cpu()
     example_args = (example_input,)
+
+    if False:
+        generated_ids = decoder(input_ids,)
+        generated_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+        print("-- Check our modifications for exporting:")
+        print("Output from modified forward function: ")
+        print(generated_text)
+        print('\n')
+        tester = originalDecoder(main_model_name, draft_model_name)
+        spec_output = tester.generate(
+            prompt,
+            temperature=1.0,
+            top_k=top_k,
+            top_p=top_p,
+            gamma=5,
+            max_new_tokens=max_tokens
+        )
+        print("Output from original generate function: ")
+        print(spec_output)
+        print("-- End of sanity check")
+
    
     mlir_file_name = 'decoder_compiled.mlir'
     exec_file_name = 'decoder.vmfb'
@@ -124,23 +148,32 @@ def benchmark_v2(
         with open(mlir_file_name, 'w') as sys.stdout:
             decoder_compiled.mlir_module.print()
         sys.stdout = original
+
+        compiled_flatbuffer = ireec.tools.compile_file(
+            mlir_file_name,
+            output_file=exec_file_name,
+            target_backends=["llvm-cpu"], #["vmvx"],
+            extra_args=[
+                        "--iree-llvmcpu-debug-symbols=false",
+                        "--iree-llvmcpu-target-cpu=host",
+                        "--iree-llvmcpu-target-cpu-features=host"
+                        ]
+        )
         print('Compiled')
+        # run with:
+        # iree-run-module --module=decoder.vmfb --input=@sample_input.npy --device=local-task
+        exit()
+    
+    print("Running compiled module on IREE")
+    print(subprocess.run(["iree-run-module --module=decoder.vmfb --input=@sample_input.npy --device=local-task --output=@sample_output.npy"], 
+                     shell=True, capture_output=True))
+    iree_data = np.load('sample_output.npy')
+    iree_text = tokenizer.decode(iree_data[0], skip_special_tokens=True)
+    print("Text output from IREE:")
+    print(iree_text)
+    print("\n")
 
-
-    compiled_flatbuffer = ireec.tools.compile_file(
-        mlir_file_name,
-        output_file=exec_file_name,
-        target_backends=["llvm-cpu"], #["vmvx"],
-        extra_args=[
-                    "--iree-llvmcpu-debug-symbols=false",
-                    "--iree-llvmcpu-target-cpu=host",
-                    "--iree-llvmcpu-target-cpu-features=host"
-                    ]
-    )
-    # run with:
-    # iree-run-module --module=decoder.vmfb --input=@sample_input.npy --device=local-task
-    exit()
-
+    print("Running original benchmark stuff...:")
     spec_runtimes = []
     greedy_runtimes = []
     spec_tokens_per_second = []
