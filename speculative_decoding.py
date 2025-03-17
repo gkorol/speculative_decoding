@@ -94,6 +94,7 @@ class SpeculativeDecoderExp(torch.nn.Module):
             generated_tokens = torch.cat([generated_tokens, accepted_tokens], dim=-1)
 
             # TODO: Check for and break when EOS
+            # TODO: accepted tokens has to account for max_new_tokens
     
         return generated_tokens
 
