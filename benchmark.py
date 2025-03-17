@@ -8,7 +8,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
 import numpy as np
 import sys
-import os.path
+import os
 
 
 from iree import compiler as ireec
@@ -98,7 +98,8 @@ def benchmark_v2(
                     avg_spec_tokens_per_second, avg_greedy_tokens_per_second)
     """
     decoder = SpeculativeDecoderExp(main_model_name, draft_model_name)
-    prompt = "Once upon a time, "
+    prompt = "Once upon a time"
+    # prompt = "Say something about the letter A"
     
     tokenizer = AutoTokenizer.from_pretrained(main_model_name)
     if tokenizer.pad_token is None:
@@ -110,8 +111,8 @@ def benchmark_v2(
     example_input = example_encoding["input_ids"].cpu()
     example_args = (example_input,)
 
-    if False:
-        generated_ids = decoder(input_ids,)
+    if True:
+        generated_ids = decoder(input_ids)
         generated_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
         print("-- Check our modifications for exporting:")
         print("Output from modified forward function: ")
@@ -134,10 +135,6 @@ def benchmark_v2(
     mlir_file_name = 'decoder_compiled.mlir'
     exec_file_name = 'decoder.vmfb'
     sample_input_file_name = 'sample_input.npy'
-    if not os.path.isfile(sample_input_file_name):
-        print('Dumping sample input (for iree runtime) to file and exiting')
-        np.save(sample_input_file_name,example_args[0].to())
-        exit()
 
     if not os.path.isfile(exec_file_name):
         print('Exporting')
@@ -149,12 +146,14 @@ def benchmark_v2(
             decoder_compiled.mlir_module.print()
         sys.stdout = original
 
+        # TODO: input size gets 'hard-coded# in to the mlir. Need dynamic shape here
         compiled_flatbuffer = ireec.tools.compile_file(
             mlir_file_name,
             output_file=exec_file_name,
-            target_backends=["llvm-cpu"], #["vmvx"],
+            target_backends=["llvm-cpu"],
             extra_args=[
-                        "--iree-llvmcpu-debug-symbols=false",
+                        # "--iree-llvmcpu-debug-symbols=false",
+                        "--iree-hal-executable-debug-level=3",
                         "--iree-llvmcpu-target-cpu=host",
                         "--iree-llvmcpu-target-cpu-features=host"
                         ]
@@ -162,8 +161,13 @@ def benchmark_v2(
         print('Compiled')
         # run with:
         # iree-run-module --module=decoder.vmfb --input=@sample_input.npy --device=local-task
-        exit()
     
+    print('Dumping sample input (for iree runtime) to file and exiting')
+    if os.path.exists("sample_input.npy"):
+        os.remove("sample_input.npy")
+    if os.path.exists("sample_output.npy"):
+        os.remove("sample_output.npy")
+    np.save(sample_input_file_name,example_args[0].to())
     print("Running compiled module on IREE")
     print(subprocess.run(["iree-run-module --module=decoder.vmfb --input=@sample_input.npy --device=local-task --output=@sample_output.npy"], 
                      shell=True, capture_output=True))
