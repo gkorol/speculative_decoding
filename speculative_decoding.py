@@ -2,7 +2,17 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-class SpeculativeDecoder:
+class DecisionGate(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> bool:
+        comp = torch.all(x == y)
+        if comp:
+            return True
+        else:
+            return False
+
+class SpeculativeDecoder(torch.nn.Module):
     """
     A class implementing speculative decoding for language models.
 
@@ -25,13 +35,15 @@ class SpeculativeDecoder:
             draft_model_name (str): The name or path of the draft (smaller) model.
             device (str): The device to run the models on. Defaults to 'cuda' if available, else 'cpu'.
         """
+        super().__init__()
+        
         self.device = device
         self.target_model = AutoModelForCausalLM.from_pretrained(target_model_name).to(self.device)
         self.draft_model = AutoModelForCausalLM.from_pretrained(draft_model_name).to(self.device)
-        self.tokenizer = AutoTokenizer.from_pretrained(target_model_name)
-        
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.gate = DecisionGate()
+        # self.tokenizer = AutoTokenizer.from_pretrained(target_model_name)        
+        # if self.tokenizer.pad_token is None:
+        #     self.tokenizer.pad_token = self.tokenizer.eos_token
         
         self.target_model.eval()
         self.draft_model.eval()
@@ -71,7 +83,63 @@ class SpeculativeDecoder:
         
         return F.softmax(logits, dim=-1)
 
-    def generate(self, prompt, temperature=1.0, top_k=0, top_p=1.0, gamma=5, max_new_tokens=100):
+    # def forward(self, input_ids, pad_token_id, len_encoded_prompt, temperature=1.0, top_k=0, top_p=1.0, gamma=5, max_new_tokens=100):
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        # return self.generate(input_ids, pad_token_id, len_encoded_prompt, temperature, top_k, top_p, gamma, max_new_tokens)
+        # return self.draft_model(input_ids)
+        generated_tokens = input_ids.clone()  # Start with the input sequence
+        max_new_tokens = 5 # TODO: this is a parameter
+
+        for _ in range(max_new_tokens):
+            # version 1)
+            #   TODO: fix control flow error from if
+            # with torch.no_grad():
+            #     draft_logits = self.draft_model(generated_tokens).logits[:, -1, :]
+            #     draft_tokens = torch.topk(draft_logits, k=1, dim=-1).indices  # Greedy selection
+            #     candidate_sequence = torch.cat([generated_tokens, draft_tokens], dim=-1)
+            #     # Target model evaluates the candidate sequence
+            #     target_logits = self.target_model(candidate_sequence).logits[:, -len(draft_tokens):, :]
+            #     target_tokens = torch.argmax(target_logits, dim=-1)  # Greedy decoding
+            # # Compare draft tokens and target tokens
+            # # if torch.equal(draft_tokens, target_tokens): # gives unsupported op (equal)
+            # if torch.all(draft_tokens == target_tokens):
+            #     # If they match, accept the draft tokens
+            #     generated_tokens = candidate_sequence
+            # else:
+            #     # If mismatch, take only the first token from the target model
+            #     generated_tokens = torch.cat([generated_tokens, target_tokens[:, :1]], dim=-1)
+            # # Stop if EOS token is generated
+            # if generated_tokens[0, -1] == 50256:  # GPT-2 EOS token
+            #     break
+            # end of version 1
+
+            # version 2)
+            #   uses the indices to check draft and target tokens...
+            #   TODO fix removal of EOS
+            #      or always do it as a post-processing step outside the model
+            with torch.no_grad():
+                draft_logits: torch.Tensor = self.draft_model(generated_tokens).logits  # (1, seq_len, vocab_size)
+                draft_token: torch.Tensor = torch.argmax(draft_logits[:, -1, :], dim=-1, keepdim=True)  # (1, 1)
+                candidate_sequence: torch.Tensor = torch.cat([generated_tokens, draft_token], dim=-1)  # (1, seq_len + 1)
+                # 2. Target Model Verifies the Candidate Tokens
+                target_logits: torch.Tensor = self.target_model(candidate_sequence).logits  # (1, seq_len + 1, vocab_size)
+                target_token: torch.Tensor = torch.argmax(target_logits[:, -1, :], dim=-1, keepdim=True)  # (1, 1)
+            # Instead of if-else, use torch.where() to always compute both options and select dynamically
+            accepted_token: torch.Tensor = torch.where(
+                (draft_token == target_token), draft_token, target_token
+            )  # (1, 1)
+            generated_tokens = torch.cat([generated_tokens, accepted_token], dim=-1)
+            # # Check EOS
+            # eos_token_id = 50256  # GPT-2 EOS token
+            # is_eos: torch.Tensor = (accepted_token == eos_token_id).to(torch.int)  # (1, 1), 1 if EOS else 0
+            # generated_tokens = generated_tokens[:, : generated_tokens.shape[1] - int(is_eos.item())]  # Remove EOS 
+            # end of version 2
+
+        return generated_tokens
+    
+    
+    # def generate(self, prompt, temperature=1.0, top_k=0, top_p=1.0, gamma=5, max_new_tokens=100):
+    def generate(self, input_ids, pad_token_id, len_encoded_prompt, temperature=1.0, top_k=0, top_p=1.0, gamma=5, max_new_tokens=100):
         """
         Generate text using speculative decoding.
 
@@ -86,33 +154,33 @@ class SpeculativeDecoder:
         Returns:
             str: The generated text.
         """
-        input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(self.device)
+        # input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(self.device)
         attention_mask = torch.ones_like(input_ids)
         
         for _ in range(0, max_new_tokens, gamma + 1):
             # Generate draft outputs
-            with torch.no_grad():
-                draft_outputs = self.draft_model.generate(
-                    input_ids,
-                    attention_mask=attention_mask,
-                    max_new_tokens=gamma,
-                    do_sample=True,
-                    temperature=temperature,
-                    top_k=top_k,
-                    top_p=top_p,
-                    return_dict_in_generate=True,
-                    output_scores=True,
-                    pad_token_id=self.tokenizer.pad_token_id,
-                )
+            # with torch.no_grad():
+            draft_outputs = self.draft_model.generate(
+                input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=gamma,
+                do_sample=True,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                return_dict_in_generate=True,
+                output_scores=True,
+                pad_token_id=pad_token_id,
+            )
             draft_tokens = draft_outputs.sequences[:, input_ids.size(1):] #torch.Size([1, 5])
             draft_probs = torch.stack(draft_outputs.scores).softmax(-1) #torch.Size([5, 1, 50257]) for GPT2
             # Target model single forward pass
-            with torch.no_grad():
-                target_outputs = self.target_model(
-                    torch.cat([input_ids, draft_tokens], dim=1),
-                    attention_mask=torch.cat([attention_mask, torch.ones_like(draft_tokens)], dim=1),
-                    return_dict=True,
-                )
+            # with torch.no_grad():
+            target_outputs = self.target_model(
+                torch.cat([input_ids, draft_tokens], dim=1),
+                attention_mask=torch.cat([attention_mask, torch.ones_like(draft_tokens)], dim=1),
+                return_dict=True,
+            )
             
             target_logits = target_outputs.logits[:, input_ids.size(1)-1:-1]
             target_probs = self.sample(target_logits, temperature, top_k, top_p)
@@ -153,10 +221,11 @@ class SpeculativeDecoder:
             input_ids = torch.cat([input_ids, new_tokens], dim=1)
             attention_mask = torch.cat([attention_mask, torch.ones_like(new_tokens)], dim=1) #update for next generation
             
-            if input_ids.size(1) - len(self.tokenizer.encode(prompt)) >= max_new_tokens:
+            if input_ids.size(1) - len_encoded_prompt >= max_new_tokens:
                 break
         
-        return self.tokenizer.decode(input_ids[0], skip_special_tokens=True)
+        # return self.tokenizer.decode(input_ids[0], skip_special_tokens=True)
+        return input_ids[0]
 
 
     def target_generate_greedy(self, prompt, max_new_tokens=50):
